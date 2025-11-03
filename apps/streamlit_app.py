@@ -6,8 +6,14 @@ import joblib
 import json
 import math
 from io import StringIO
+import io
+import glob
 import numpy as np
+import pandas as pd
 from sklearn import metrics as skl_metrics
+from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.svm import LinearSVC
 
 # Ensure project root is on sys.path so `scripts` package is importable
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -73,18 +79,98 @@ def predict_proba_text(vectorizer, model, text: str):
         return None
 
 
+@st.cache_resource
+def train_demo_pipeline(sample_path: str | Path):
+    """Train a small demo Pipeline on the sample dataset for cloud/demo use."""
+    try:
+        p = Path(sample_path)
+        if not p.exists():
+            return None
+        df = pd.read_csv(p, header=None, names=["label", "message"]).dropna()
+        df["message_clean"] = df["message"].map(preprocess_text)
+        y = (df["label"].str.lower() == "spam").astype(int).values
+        X = df["message_clean"].tolist()
+        pipe = Pipeline([
+            ("tfidf", TfidfVectorizer(max_features=20000, ngram_range=(1, 2))),
+            ("clf", LinearSVC())
+        ])
+        pipe.fit(X, y)
+        return pipe
+    except Exception as e:
+        st.error(f"Failed to train demo model: {e}")
+        return None
+
+
+def ensure_demo_model(default_model_path: str = "models/pipeline.joblib"):
+    """Return a Pipeline model: load if exists, otherwise train on sample and best-effort save."""
+    mp = Path(default_model_path)
+    # Try loading existing
+    if mp.exists():
+        obj = load_model(str(mp))
+        _, mdl = get_vectorizer_and_model(obj)
+        if mdl is not None:
+            return mdl
+    # Train demo
+    demo = train_demo_pipeline("data/sample.csv")
+    if demo is not None:
+        try:
+            mp.parent.mkdir(parents=True, exist_ok=True)
+            joblib.dump(demo, mp)
+        except Exception:
+            # read-only env, ignore
+            pass
+        return demo
+    return None
+
+
 def main():
     st.title("Spam Classifier — Live Demo")
 
+    # --- Sidebar: Model management ---
     st.sidebar.header("Model & Data")
-    model_path = st.sidebar.text_input("Model path", value="models/baseline-svm.joblib")
-    if not model_path:
-        st.sidebar.warning("Specify model path")
+    model_source = st.sidebar.radio(
+        "Model source",
+        options=["Demo (auto)", "From path", "Upload .joblib"],
+        index=0,
+    )
 
-    load_button = st.sidebar.button("Load model")
-    model_obj = load_model(model_path) if model_path else None
-    vect, model = get_vectorizer_and_model(model_obj)
+    model = None
+    vect = None
+    model_obj = None
 
+    if model_source == "Demo (auto)":
+        model = ensure_demo_model()
+        if model is None:
+            st.sidebar.error("Failed to load/train demo model. Try 'From path' or upload.")
+        else:
+            st.sidebar.success("Demo model ready")
+
+    elif model_source == "From path":
+        model_path = st.sidebar.text_input("Model path", value="models/pipeline.joblib")
+        if model_path and st.sidebar.button("Load model"):
+            model_obj = load_model(model_path)
+        if model_obj is None and model_path and Path(model_path).exists():
+            model_obj = load_model(model_path)
+        vect, model = get_vectorizer_and_model(model_obj)
+        if model is None:
+            st.sidebar.warning("Model not found at path.")
+        else:
+            st.sidebar.success("Model loaded from path")
+
+    else:  # Upload
+        uploaded = st.sidebar.file_uploader("Upload model (.joblib)", type=["joblib"])
+        if uploaded is not None:
+            try:
+                model_obj = joblib.load(uploaded)
+                vect, model = get_vectorizer_and_model(model_obj)
+                if model is not None:
+                    st.sidebar.success("Uploaded model loaded")
+                else:
+                    st.sidebar.error("Uploaded file did not contain a valid model")
+            except Exception as e:
+                st.sidebar.error(f"Failed to load uploaded model: {e}")
+
+    # --- Sidebar: Metrics file (optional) ---
     st.sidebar.markdown("---")
     metrics_path = st.sidebar.text_input("Metrics path", value="artifacts/metrics.json")
     if Path(metrics_path).exists():
@@ -97,11 +183,24 @@ def main():
         except Exception as e:
             st.sidebar.write(f"Failed to read metrics: {e}")
 
+    # --- Quick predict ---
     st.header("Quick predict")
-    user_text = st.text_area("Enter message to classify", height=120)
+
+    # Example buttons
+    if "example_text" not in st.session_state:
+        st.session_state.example_text = ""
+    col_ex1, col_ex2, _ = st.columns(3)
+    with col_ex1:
+        if st.button("Example SPAM"):
+            st.session_state.example_text = "Free entry in 2 a wkly comp to win cash! Call now!"
+    with col_ex2:
+        if st.button("Example HAM"):
+            st.session_state.example_text = "Hey, are we still on for lunch at 12:30?"
+
+    user_text = st.text_area("Enter message to classify", height=120, value=st.session_state.example_text)
     if st.button("Predict"):
-        if not model:
-            st.error("No model loaded. Check the model path or press Load model.")
+        if model is None:
+            st.error("No model loaded. Select a model source in the sidebar.")
         else:
             proba = predict_proba_text(vect, model, user_text)
             if proba is not None:
@@ -126,9 +225,13 @@ def main():
         if uploaded is not None:
             try:
                 s = StringIO(uploaded.getvalue().decode('utf-8'))
-                import pandas as pd
-    
-                eval_df = pd.read_csv(s, header=None, names=["label", "message"]).dropna()
+                # Auto-detect header
+                peek = pd.read_csv(s, nrows=1, header=None)
+                s.seek(0)
+                has_header = False
+                if isinstance(peek.iloc[0, 0], str) and peek.iloc[0, 0].lower() in ("label", "spam", "ham"):
+                    has_header = True
+                eval_df = pd.read_csv(s, header=0 if has_header else None, names=["label", "message"]).dropna()
             except Exception as e:
                 st.error(f"Failed to read uploaded CSV: {e}")
     
@@ -207,6 +310,33 @@ def main():
                     'f1': skl_metrics.f1_score(y_true, y_pred, zero_division=0),
                 }
                 st.json(metrics)
+
+                # Token frequency explorer
+                st.subheader("Token frequency (top N)")
+                top_n = st.slider("Top N", 10, 50, 20)
+                try:
+                    from collections import Counter
+                    tokens_spam = []
+                    tokens_ham = []
+                    for lbl, msg in zip(eval_df["label"].str.lower(), eval_df["message"].tolist()):
+                        toks = preprocess_text(msg).split()
+                        if lbl == "spam":
+                            tokens_spam.extend(toks)
+                        else:
+                            tokens_ham.extend(toks)
+                    cs = Counter(tokens_spam)
+                    ch = Counter(tokens_ham)
+                    top_spam = cs.most_common(top_n)
+                    top_ham = ch.most_common(top_n)
+                    colts1, colts2 = st.columns(2)
+                    with colts1:
+                        st.write("Top tokens — SPAM")
+                        st.table(pd.DataFrame(top_spam, columns=["token", "count"]))
+                    with colts2:
+                        st.write("Top tokens — HAM")
+                        st.table(pd.DataFrame(top_ham, columns=["token", "count"]))
+                except Exception as e:
+                    st.info(f"Token explorer unavailable: {e}")
     
         elif eval_df is None:
             st.info("No evaluation dataset available. Upload a CSV or include `data/sample.csv`.")
@@ -215,8 +345,32 @@ def main():
     if cm_path.exists():
         st.image(str(cm_path), caption="Confusion matrix")
 
+    # Visualizations gallery (pre-generated images if present)
+    viz_dir = Path("reports/visualizations")
+    if viz_dir.exists():
+        st.header("Visualizations gallery")
+        images = sorted(glob.glob(str(viz_dir / "*.png")))
+        if images:
+            for img in images:
+                st.image(img)
+        else:
+            st.info("No images found under reports/visualizations.")
+
     st.markdown("---")
-    st.write("Model file:", model_path)
+    if model is not None:
+        # Offer model download
+        try:
+            buffer = io.BytesIO()
+            joblib.dump(model, buffer)
+            buffer.seek(0)
+            st.download_button(
+                label="Download current model",
+                data=buffer,
+                file_name="pipeline.joblib",
+                mime="application/octet-stream",
+            )
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
