@@ -14,6 +14,7 @@ from sklearn import metrics as skl_metrics
 from sklearn.pipeline import Pipeline
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.svm import LinearSVC
+import requests
 
 # Ensure project root is on sys.path so `scripts` package is importable
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.preprocess import preprocess_text
+try:
+    from scripts.download_dataset import DEFAULT_URL as PACKT_DATA_URL
+except Exception:
+    PACKT_DATA_URL = (
+        "https://raw.githubusercontent.com/PacktPublishing/Hands-On-Artificial-Intelligence-for-Cybersecurity/"
+        "master/Chapter03/datasets/sms_spam_no_header.csv"
+    )
 
 
 @st.cache_resource
@@ -123,6 +131,52 @@ def ensure_demo_model(default_model_path: str = "models/pipeline.joblib"):
     return None
 
 
+@st.cache_resource
+def train_pipeline_on_df(df: pd.DataFrame):
+    """Train a Pipeline on a label/message DataFrame."""
+    try:
+        df = df.dropna()
+        df["message_clean"] = df["message"].map(preprocess_text)
+        y = (df["label"].str.lower() == "spam").astype(int).values
+        X = df["message_clean"].tolist()
+        pipe = Pipeline([
+            ("tfidf", TfidfVectorizer(max_features=20000, ngram_range=(1, 2))),
+            ("clf", LinearSVC())
+        ])
+        pipe.fit(X, y)
+        return pipe
+    except Exception as e:
+        st.error(f"Failed to train model: {e}")
+        return None
+
+
+@st.cache_data
+def load_dataset_from_url(url: str) -> pd.DataFrame | None:
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        s = StringIO(resp.content.decode('utf-8', errors='ignore'))
+        df = pd.read_csv(s, header=None, names=["label", "message"]).dropna()
+        return df
+    except Exception as e:
+        st.error(f"Failed to load dataset from URL: {e}")
+        return None
+
+
+@st.cache_data
+def load_dataset_from_path(path: str | Path) -> pd.DataFrame | None:
+    try:
+        p = Path(path)
+        if not p.exists():
+            st.warning(f"Dataset not found at {p}")
+            return None
+        df = pd.read_csv(p, header=None, names=["label", "message"]).dropna()
+        return df
+    except Exception as e:
+        st.error(f"Failed to load dataset from path: {e}")
+        return None
+
+
 def main():
     st.title("Spam Classifier — Live Demo")
 
@@ -207,25 +261,34 @@ def main():
                 st.metric(label="Spam probability", value=f"{proba*100:.2f}%")
                 st.write("**Label:** ", "SPAM" if proba >= 0.5 else "HAM")
 
-    st.header("Sample data & artifacts")
-    sample_csv = Path("data/sample.csv")
-    if sample_csv.exists():
-        st.write("Sample dataset (first 10 rows)")
-        import pandas as pd
+    st.header("Dataset & evaluation")
+    st.write("Choose a dataset source, optionally train a model from it, and explore metrics and charts.")
 
-        df = pd.read_csv(sample_csv, header=None, names=["label", "message"]).head(10)
-        st.table(df)
-    
-        # --- Interactive evaluation / visualization ---
-        st.header("Interactive evaluation")
-        st.write("Use the sample dataset or upload a CSV with `label,message` columns to evaluate and visualize model behavior.")
-    
+    ds_source = st.radio(
+        "Dataset source",
+        options=["From URL (Packt)", "From path", "Upload CSV"],
+        index=0,
+        horizontal=True,
+    )
+
+    eval_df = None
+    if ds_source == "From URL (Packt)":
+        url = st.text_input("Dataset URL", value=PACKT_DATA_URL)
+        if st.button("Load dataset from URL"):
+            eval_df = load_dataset_from_url(url)
+        if eval_df is None:
+            eval_df = load_dataset_from_url(url)
+    elif ds_source == "From path":
+        p = st.text_input("Dataset path", value="data/sms_spam_no_header.csv")
+        if st.button("Load dataset from path"):
+            eval_df = load_dataset_from_path(p)
+        if eval_df is None:
+            eval_df = load_dataset_from_path(p)
+    else:
         uploaded = st.file_uploader("Upload CSV (label,message)", type=["csv"])
-        eval_df = None
         if uploaded is not None:
             try:
                 s = StringIO(uploaded.getvalue().decode('utf-8'))
-                # Auto-detect header
                 peek = pd.read_csv(s, nrows=1, header=None)
                 s.seek(0)
                 has_header = False
@@ -234,112 +297,152 @@ def main():
                 eval_df = pd.read_csv(s, header=0 if has_header else None, names=["label", "message"]).dropna()
             except Exception as e:
                 st.error(f"Failed to read uploaded CSV: {e}")
-    
-        else:
-            sample_csv = Path("data/sample.csv")
-            if sample_csv.exists():
-                import pandas as pd
-    
-                eval_df = pd.read_csv(sample_csv, header=None, names=["label", "message"]).dropna()
-    
-        if eval_df is not None and model is not None:
-            eval_df["message_clean"] = eval_df["message"].map(preprocess_text)
-            y_true = (eval_df["label"].str.lower() == "spam").astype(int).values
-    
-            # Get scores
-            def get_scores(df_messages):
-                try:
-                    if vect is None:
-                        # Pipeline handles vectorizing
-                        if hasattr(model, 'predict_proba'):
-                            proba = model.predict_proba(df_messages)[:, 1]
-                        else:
-                            score = model.decision_function(df_messages)
-                            proba = 1 / (1 + np.exp(-score))
-                    else:
-                        X = vect.transform(df_messages)
-                        if hasattr(model, 'predict_proba'):
-                            proba = model.predict_proba(X)[:, 1]
-                        else:
-                            score = model.decision_function(X)
-                            proba = 1 / (1 + np.exp(-score))
-                    return proba
-                except Exception as e:
-                    st.error(f"Failed to compute scores: {e}")
-                    return None
-    
-            scores = get_scores(eval_df["message_clean"].tolist())
-            if scores is not None:
-                fpr, tpr, roc_thresh = skl_metrics.roc_curve(y_true, scores)
-                precision, recall, pr_thresh = skl_metrics.precision_recall_curve(y_true, scores)
-                auc = skl_metrics.auc(fpr, tpr)
-    
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.subheader("ROC Curve")
-                    import matplotlib.pyplot as plt
-    
-                    fig1, ax1 = plt.subplots()
-                    ax1.plot(fpr, tpr, label=f"AUC={auc:.3f}")
-                    ax1.plot([0, 1], [0, 1], linestyle='--', color='gray')
-                    ax1.set_xlabel('FPR')
-                    ax1.set_ylabel('TPR')
-                    ax1.legend()
-                    st.pyplot(fig1)
-    
-                with col2:
-                    st.subheader("Precision-Recall")
-                    fig2, ax2 = plt.subplots()
-                    ax2.plot(recall, precision)
-                    ax2.set_xlabel('Recall')
-                    ax2.set_ylabel('Precision')
-                    st.pyplot(fig2)
-    
-                st.subheader("Threshold & Confusion Matrix")
-                thresh = st.slider("Classification threshold", min_value=0.0, max_value=1.0, value=0.5)
-                y_pred = (scores >= thresh).astype(int)
-                cm = skl_metrics.confusion_matrix(y_true, y_pred)
-                tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
-                st.write(f"Threshold: {thresh:.2f}")
-                st.write("Confusion matrix:")
-                st.write(cm)
-                metrics = {
-                    'accuracy': skl_metrics.accuracy_score(y_true, y_pred),
-                    'precision': skl_metrics.precision_score(y_true, y_pred, zero_division=0),
-                    'recall': skl_metrics.recall_score(y_true, y_pred, zero_division=0),
-                    'f1': skl_metrics.f1_score(y_true, y_pred, zero_division=0),
-                }
-                st.json(metrics)
 
-                # Token frequency explorer
-                st.subheader("Token frequency (top N)")
-                top_n = st.slider("Top N", 10, 50, 20)
-                try:
-                    from collections import Counter
-                    tokens_spam = []
-                    tokens_ham = []
-                    for lbl, msg in zip(eval_df["label"].str.lower(), eval_df["message"].tolist()):
-                        toks = preprocess_text(msg).split()
-                        if lbl == "spam":
-                            tokens_spam.extend(toks)
-                        else:
-                            tokens_ham.extend(toks)
-                    cs = Counter(tokens_spam)
-                    ch = Counter(tokens_ham)
-                    top_spam = cs.most_common(top_n)
-                    top_ham = ch.most_common(top_n)
-                    colts1, colts2 = st.columns(2)
-                    with colts1:
-                        st.write("Top tokens — SPAM")
-                        st.table(pd.DataFrame(top_spam, columns=["token", "count"]))
-                    with colts2:
-                        st.write("Top tokens — HAM")
-                        st.table(pd.DataFrame(top_ham, columns=["token", "count"]))
-                except Exception as e:
-                    st.info(f"Token explorer unavailable: {e}")
-    
-        elif eval_df is None:
-            st.info("No evaluation dataset available. Upload a CSV or include `data/sample.csv`.")
+    if eval_df is not None:
+        st.write("Loaded dataset preview (first 10 rows):")
+        st.table(eval_df.head(10))
+
+        if st.button("Train/Reload model from dataset"):
+            trained = train_pipeline_on_df(eval_df)
+            if trained is not None:
+                model = trained
+                vect = None
+                st.success("Model trained from dataset")
+
+    if eval_df is not None and model is not None:
+        eval_df["message_clean"] = eval_df["message"].map(preprocess_text)
+        y_true = (eval_df["label"].str.lower() == "spam").astype(int).values
+
+        def get_scores(df_messages):
+            try:
+                if vect is None:
+                    if hasattr(model, 'predict_proba'):
+                        proba = model.predict_proba(df_messages)[:, 1]
+                    else:
+                        score = model.decision_function(df_messages)
+                        proba = 1 / (1 + np.exp(-score))
+                else:
+                    X = vect.transform(df_messages)
+                    if hasattr(model, 'predict_proba'):
+                        proba = model.predict_proba(X)[:, 1]
+                    else:
+                        score = model.decision_function(X)
+                        proba = 1 / (1 + np.exp(-score))
+                return proba
+            except Exception as e:
+                st.error(f"Failed to compute scores: {e}")
+                return None
+
+        scores = get_scores(eval_df["message_clean"].tolist())
+        if scores is not None:
+            fpr, tpr, roc_thresh = skl_metrics.roc_curve(y_true, scores)
+            precision, recall, pr_thresh = skl_metrics.precision_recall_curve(y_true, scores)
+            auc = skl_metrics.auc(fpr, tpr)
+
+            # Class distribution
+            st.subheader("Class distribution")
+            import matplotlib.pyplot as plt
+            counts = pd.Series(y_true).map({0: 'HAM', 1: 'SPAM'}).value_counts()
+            fig0, ax0 = plt.subplots()
+            ax0.bar(counts.index, counts.values, color=['#4caf50', '#f44336'])
+            ax0.set_ylabel('Count')
+            st.pyplot(fig0)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("ROC Curve")
+
+                fig1, ax1 = plt.subplots()
+                ax1.plot(fpr, tpr, label=f"AUC={auc:.3f}")
+                ax1.plot([0, 1], [0, 1], linestyle='--', color='gray')
+                ax1.set_xlabel('FPR')
+                ax1.set_ylabel('TPR')
+                ax1.legend()
+                st.pyplot(fig1)
+
+            with col2:
+                st.subheader("Precision-Recall")
+                fig2, ax2 = plt.subplots()
+                ax2.plot(recall, precision)
+                ax2.set_xlabel('Recall')
+                ax2.set_ylabel('Precision')
+                st.pyplot(fig2)
+
+            st.subheader("Threshold & Confusion Matrix")
+            thresh = st.slider("Classification threshold", min_value=0.0, max_value=1.0, value=0.5)
+            y_pred = (scores >= thresh).astype(int)
+            cm = skl_metrics.confusion_matrix(y_true, y_pred)
+            st.write(f"Threshold: {thresh:.2f}")
+            st.write("Confusion matrix (heatmap):")
+            figcm, axcm = plt.subplots()
+            im = axcm.imshow(cm, cmap='Blues')
+            for (i, j), val in np.ndenumerate(cm):
+                axcm.text(j, i, int(val), ha='center', va='center')
+            axcm.set_xticks([0, 1], labels=['HAM', 'SPAM'])
+            axcm.set_yticks([0, 1], labels=['HAM', 'SPAM'])
+            axcm.set_xlabel('Predicted')
+            axcm.set_ylabel('True')
+            figcm.colorbar(im, ax=axcm)
+            st.pyplot(figcm)
+            metrics = {
+                'accuracy': skl_metrics.accuracy_score(y_true, y_pred),
+                'precision': skl_metrics.precision_score(y_true, y_pred, zero_division=0),
+                'recall': skl_metrics.recall_score(y_true, y_pred, zero_division=0),
+                'f1': skl_metrics.f1_score(y_true, y_pred, zero_division=0),
+            }
+            st.json(metrics)
+
+            # Token frequency explorer + bars
+            st.subheader("Token frequency (top N)")
+            top_n = st.slider("Top N", 10, 50, 20)
+            try:
+                from collections import Counter
+                tokens_spam = []
+                tokens_ham = []
+                for lbl, msg in zip(eval_df["label"].str.lower(), eval_df["message"].tolist()):
+                    toks = preprocess_text(msg).split()
+                    if lbl == "spam":
+                        tokens_spam.extend(toks)
+                    else:
+                        tokens_ham.extend(toks)
+                cs = Counter(tokens_spam)
+                ch = Counter(tokens_ham)
+                top_spam = cs.most_common(top_n)
+                top_ham = ch.most_common(top_n)
+                colts1, colts2 = st.columns(2)
+                with colts1:
+                    st.write("Top tokens — SPAM")
+                    df_sp = pd.DataFrame(top_spam, columns=["token", "count"]) 
+                    st.table(df_sp)
+                    figsp, axsp = plt.subplots()
+                    axsp.barh(df_sp["token"][::-1], df_sp["count"][::-1], color='#f44336')
+                    axsp.set_xlabel('Count')
+                    st.pyplot(figsp)
+                with colts2:
+                    st.write("Top tokens — HAM")
+                    df_hm = pd.DataFrame(top_ham, columns=["token", "count"]) 
+                    st.table(df_hm)
+                    fighm, axhm = plt.subplots()
+                    axhm.barh(df_hm["token"][::-1], df_hm["count"][::-1], color='#4caf50')
+                    axhm.set_xlabel('Count')
+                    st.pyplot(fighm)
+            except Exception as e:
+                st.info(f"Token explorer unavailable: {e}")
+
+            # Threshold sweep (F1 vs threshold)
+            st.subheader("Threshold sweep (F1)")
+            thr = np.linspace(0.0, 1.0, 51)
+            f1s = []
+            for t in thr:
+                yp = (scores >= t).astype(int)
+                f1s.append(skl_metrics.f1_score(y_true, yp, zero_division=0))
+            figth, axth = plt.subplots()
+            axth.plot(thr, f1s)
+            axth.set_xlabel('Threshold')
+            axth.set_ylabel('F1')
+            st.pyplot(figth)
+    else:
+        st.info("Choose a dataset (URL/path/upload) and/or load a model in the sidebar.")
 
     cm_path = Path("artifacts/confusion_matrix.png")
     if cm_path.exists():
